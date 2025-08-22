@@ -1,8 +1,8 @@
 import sqlite3
 import os
 import uuid
-from datetime import datetime, date, timedelta, time
-from typing import Optional, Tuple
+from datetime import datetime, date, timedelta
+from typing import Optional
 
 import pandas as pd
 import numpy as np
@@ -24,28 +24,53 @@ SMTP_TO = os.environ.get("SMTP_TO")
 SMTP_FROM = os.environ.get("SMTP_FROM", SMTP_USER or "clarity@localhost")
 
 # ----------------------------------
+# Utilities
+# ----------------------------------
+
+def safe_toast(msg: str, kind: str = "info"):
+    if not HAS_STREAMLIT:
+        return
+    if hasattr(st, "toast"):
+        st.toast(msg)
+    else:
+        if kind == "success":
+            st.success(msg)
+        elif kind == "warning":
+            st.warning(msg)
+        elif kind == "error":
+            st.error(msg)
+        else:
+            st.info(msg)
+
+
+# ----------------------------------
 # DB Helpers & Migrations
 # ----------------------------------
 
 def get_conn():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA foreign_keys=ON;")
+    conn.execute("PRAGMA busy_timeout=3000;")  # avoid transient locks
     return conn
+
+
+def db_execute(sql: str, params=()):
+    conn = get_conn()
+    try:
+        cur = conn.execute(sql, params)
+        conn.commit()
+        return cur
+    except Exception as e:
+        if HAS_STREAMLIT:
+            st.error(f"DB error: {e.__class__.__name__}")
+        raise
 
 
 def init_db():
     conn = get_conn()
     cur = conn.cursor()
-    # Weeks (kept for potential future summaries)
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS weeks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            week_start TEXT UNIQUE
-        )
-        """
-    )
-    # Ideas/Notes (repurposed: notes over scoring)
+    # Notes (replaces old scoring UI)
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS ideas (
@@ -74,7 +99,7 @@ def init_db():
             confidence REAL DEFAULT 0.7,
             energy REAL DEFAULT 0.7,
             context TEXT,
-            standalone INTEGER DEFAULT 1,  -- 1 standalone, 0 if derived from idea
+            standalone INTEGER DEFAULT 1,
             priority_cache REAL,
             today_top3 INTEGER DEFAULT 0,
             top3_date TEXT,
@@ -89,7 +114,6 @@ def init_db():
 
 
 def migrate_db():
-    """Add missing columns safely (idempotent)."""
     conn = get_conn()
     cur = conn.cursor()
     # ideas table columns
@@ -103,9 +127,8 @@ def migrate_db():
     # tasks table columns
     cur.execute("PRAGMA table_info(tasks)")
     tcol = {r[1] for r in cur.fetchall()}
-    if "notes" not in tcol:
-        conn.execute("ALTER TABLE tasks ADD COLUMN notes TEXT")
     for col, sql in {
+        "notes": "ALTER TABLE tasks ADD COLUMN notes TEXT",
         "duration": "ALTER TABLE tasks ADD COLUMN duration REAL DEFAULT 1.0",
         "impact": "ALTER TABLE tasks ADD COLUMN impact REAL DEFAULT 3.0",
         "confidence": "ALTER TABLE tasks ADD COLUMN confidence REAL DEFAULT 0.7",
@@ -202,14 +225,12 @@ def can_add_to_top3(today_iso: Optional[str] = None, cap: int = 3) -> bool:
 
 
 def set_top3(task_id: int, active: bool, today_iso: Optional[str] = None) -> bool:
-    conn = get_conn()
     if active and not can_add_to_top3(today_iso):
         return False
     if active:
-        conn.execute("UPDATE tasks SET today_top3=1, top3_date=? WHERE id=?", (today_iso or today_str(), task_id))
+        db_execute("UPDATE tasks SET today_top3=1, top3_date=? WHERE id=?", (today_iso or today_str(), task_id))
     else:
-        conn.execute("UPDATE tasks SET today_top3=0, top3_date=NULL WHERE id=?", (task_id,))
-    conn.commit()
+        db_execute("UPDATE tasks SET today_top3=0, top3_date=NULL WHERE id=?", (task_id,))
     return True
 
 
@@ -250,12 +271,8 @@ def generate_ics_for_top3(start_dt: datetime) -> bytes:
             "END:VEVENT\n"
         )
         events.append(ev)
-        conn.execute(
-            "UPDATE tasks SET planned_start=?, planned_end=? WHERE id=?",
-            (cur_start.isoformat(), (cur_start + timedelta(minutes=dur_minutes)).isoformat(), int(row.id)),
-        )
+        db_execute("UPDATE tasks SET planned_start=?, planned_end=? WHERE id=?", (cur_start.isoformat(), (cur_start + timedelta(minutes=dur_minutes)).isoformat(), int(row.id)))
         cur_start += timedelta(minutes=dur_minutes)
-    conn.commit()
 
     cal = "BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//Clarity Board//EN\n" + "".join(events) + "END:VCALENDAR\n"
     return cal.encode("utf-8")
@@ -331,14 +348,17 @@ def run_self_checks() -> pd.DataFrame:
         results.append({"test":"Plan <= capacity","passed": plan["cumulative_hours"].max() <= 3.0 + 1e-9 if not plan.empty else True})
 
         # WIP cap logic quick check
-        conn = get_conn(); conn.execute("DELETE FROM tasks"); conn.commit()
+        db_execute("DELETE FROM tasks")
         for i in range(3):
-            conn.execute(
-                "INSERT INTO tasks (created_at, title, today_top3, top3_date) VALUES (?,?,1,?)",
-                (datetime.utcnow().isoformat(), f"T{i+1}", today_str()),
-            )
-        conn.commit()
+            db_execute("INSERT INTO tasks (created_at, title, today_top3, top3_date) VALUES (?,?,1,?)", (datetime.utcnow().isoformat(), f"T{i+1}", today_str()))
         results.append({"test":"WIP cap hits at 3","passed": can_add_to_top3() is False})
+
+        # Create & delete sanity
+        cur = db_execute("INSERT INTO tasks (created_at, title) VALUES (?,?)", (datetime.utcnow().isoformat(), "tmp"))
+        tid = cur.lastrowid
+        db_execute("DELETE FROM tasks WHERE id=?", (tid,))
+        left = pd.read_sql_query("SELECT COUNT(1) c FROM tasks WHERE id=?", get_conn(), params=(tid,)).iloc[0].c
+        results.append({"test":"Delete works","passed": int(left)==0})
     except Exception as e:
         results.append({"test":"Unexpected error","passed": False, "error": str(e)})
     return pd.DataFrame(results)
@@ -349,7 +369,6 @@ def run_self_checks() -> pd.DataFrame:
 # ----------------------------------
 
 def do_rerun():
-    # Streamlit changed API: prefer st.rerun, fallback to experimental
     fn = getattr(st, "rerun", None) if HAS_STREAMLIT else None
     if fn:
         fn()
@@ -362,7 +381,7 @@ if HAS_STREAMLIT:
     init_db()
 
     st.title("Clarity — Task Prioritiser & Daily Follow‑Through")
-    st.caption("Capture → Extract → Prioritise → Top‑3 → Calendar → Ship")
+    st.caption("Capture → Document → Extract tasks → Prioritise → Top‑3 → Calendar → Ship")
 
     with st.sidebar:
         st.header("Nudges (optional)")
@@ -381,21 +400,20 @@ if HAS_STREAMLIT:
 
     tabs = st.tabs(["Ideas & Notes", "Task Prioritiser", "Follow‑Through"])
 
-    # ------------- Ideas & Notes (no scoring) -------------
+    # ------------- Ideas & Notes -------------
     with tabs[0]:
         st.subheader("Capture ideas and document them")
         with st.form("new_note", clear_on_submit=True):
             n_title = st.text_input("Title")
             n_tag = st.text_input("Tag (optional)")
-            n_body = st.text_area("Notes (Markdown)", height=160, help="Write freely. You'll extract tasks on the right.")
+            n_body = st.text_area("Notes (Markdown)", height=160, help="Write freely. Then extract tasks on the right.")
             submitted = st.form_submit_button("Save note")
             if submitted and n_title:
-                get_conn().execute(
+                db_execute(
                     "INSERT INTO ideas (created_at, title, tag, body, status) VALUES (?,?,?,?, 'active')",
-                    (datetime.utcnow().isoformat(), n_title.strip(), n_tag.strip(), n_body.strip()),
+                    (datetime.utcnow().isoformat(), n_title.strip(), (n_tag or "").strip(), (n_body or "").strip()),
                 )
-                get_conn().commit()
-                st.success("Saved ✅")
+                safe_toast("Saved ✅", "success")
 
         st.markdown("---")
         colL, colR = st.columns([1.2, 1])
@@ -418,21 +436,19 @@ if HAS_STREAMLIT:
                         c1, c2, c3 = st.columns(3)
                         with c1:
                             if st.button("Archive", key=f"arc_{row.id}"):
-                                get_conn().execute("UPDATE ideas SET status='archived' WHERE id=?", (row.id,))
-                                get_conn().commit()
-                                st.toast("Archived")
+                                db_execute("UPDATE ideas SET status='archived' WHERE id=?", (row.id,))
+                                safe_toast("Archived")
                                 do_rerun()
                         with c2:
                             new_title = st.text_input("Edit title", value=row.title, key=f"edit_title_{row.id}")
                             new_tag = st.text_input("Edit tag", value=row.tag or "", key=f"edit_tag_{row.id}")
                             new_body = st.text_area("Edit notes", value=row.body or "", key=f"edit_body_{row.id}")
                             if st.button("Save edits", key=f"save_{row.id}"):
-                                get_conn().execute(
+                                db_execute(
                                     "UPDATE ideas SET title=?, tag=?, body=? WHERE id=?",
                                     (new_title.strip(), new_tag.strip(), new_body, row.id),
                                 )
-                                get_conn().commit()
-                                st.toast("Updated")
+                                safe_toast("Updated")
                                 do_rerun()
                         with c3:
                             st.write("**Extract tasks** (one per line)")
@@ -440,18 +456,27 @@ if HAS_STREAMLIT:
                             due = st.date_input("Due (optional)", value=None, key=f"due_{row.id}")
                             ctx = st.text_input("Context", placeholder="deep-work/calls/errands", key=f"ctx_{row.id}")
                             if st.button("Create tasks", key=f"ct_{row.id}"):
-                                lines = [l.strip() for l in raw.split("\n") if l.strip()]
-                                for line in lines:
-                                    get_conn().execute(
+                                lines = [l.strip() for l in (raw or "").split("\n") if l.strip()]
+                                if lines:
+                                    now = datetime.utcnow().isoformat()
+                                    due_iso = (due.isoformat() if due else None)
+                                    rows = [
+                                        (row.id, now, line, f"From idea #{row.id}: {row.title}", due_iso, 0, 1.0, 5, 0.8, 0.7, (ctx or "").strip(), 0)
+                                        for line in lines
+                                    ]
+                                    conn = get_conn()
+                                    conn.executemany(
                                         """
-                                        INSERT INTO tasks (idea_id, created_at, title, notes, due_date, done, duration, impact, confidence, energy, context, standalone)
-                                        VALUES (?,?,?,?,?,0,1.0,5,0.8,0.7,?,0)
+                                        INSERT INTO tasks (
+                                            idea_id, created_at, title, notes, due_date, done,
+                                            duration, impact, confidence, energy, context, standalone
+                                        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
                                         """,
-                                        (row.id, datetime.utcnow().isoformat(), line, f"From idea #{row.id}: {row.title}", (due.isoformat() if due else None), ctx),
+                                        rows,
                                     )
-                                get_conn().commit()
-                                st.success(f"Created {len(lines)} task(s) ✅")
-                                do_rerun()
+                                    conn.commit()
+                                    safe_toast(f"Created {len(lines)} task(s) ✅", "success")
+                                    do_rerun()
 
         with colR:
             st.subheader("Archive / Restore")
@@ -462,9 +487,8 @@ if HAS_STREAMLIT:
                     st.write(f"#{row.id} — {row.title}")
                 with c2:
                     if st.button("Restore", key=f"res_{row.id}"):
-                        get_conn().execute("UPDATE ideas SET status='active' WHERE id=?", (row.id,))
-                        get_conn().commit()
-                        st.toast("Restored")
+                        db_execute("UPDATE ideas SET status='active' WHERE id=?", (row.id,))
+                        safe_toast("Restored")
                         do_rerun()
 
     # ------------- Task Prioritiser -------------
@@ -500,10 +524,12 @@ if HAS_STREAMLIT:
                 t_energy = st.slider("Energy fit", 0.0, 1.0, 0.7, 0.05)
             sub = st.form_submit_button("Add task")
             if sub and t_title:
-                get_conn().execute(
+                db_execute(
                     """
-                    INSERT INTO tasks (idea_id, created_at, title, notes, due_date, done, duration, impact, confidence, energy, context, standalone)
-                    VALUES (NULL,?,?,?,?,0,?,?,?,?,?,1)
+                    INSERT INTO tasks (
+                        idea_id, created_at, title, notes, due_date, done,
+                        duration, impact, confidence, energy, context, standalone
+                    ) VALUES (NULL,?,?,?,?,0,?,?,?,?,?,1)
                     """,
                     (
                         datetime.utcnow().isoformat(),
@@ -513,11 +539,10 @@ if HAS_STREAMLIT:
                         float(t_imp),
                         float(t_conf),
                         float(t_energy),
-                        t_ctx.strip(),
+                        (t_ctx or "").strip(),
                     ),
                 )
-                get_conn().commit()
-                st.success("Task added ✅")
+                safe_toast("Task added ✅", "success")
 
         # List & prioritise
         tdf = pd.read_sql_query(
@@ -564,13 +589,11 @@ if HAS_STREAMLIT:
                             do_rerun()
                 with cols[4]:
                     if st.button("Delete", key=f"t_del_{row.id}"):
-                        get_conn().execute("DELETE FROM tasks WHERE id=?", (row.id,))
-                        get_conn().commit()
-                        st.toast("Deleted")
+                        db_execute("DELETE FROM tasks WHERE id=?", (row.id,))
+                        safe_toast("Deleted")
                         do_rerun()
                 if d_toggle != bool(row.done):
-                    get_conn().execute("UPDATE tasks SET done=? WHERE id=?", (int(d_toggle), row.id))
-                    get_conn().commit()
+                    db_execute("UPDATE tasks SET done=? WHERE id=?", (int(d_toggle), row.id))
 
     # ------------- Follow‑Through -------------
     with tabs[2]:
